@@ -12,8 +12,12 @@
 import socket
 import sys
 import time
+import queue
+import threading
 import traceback
+from time import sleep
 from copy import deepcopy
+from collections import OrderedDict
 
 import dns.resolver
 
@@ -180,6 +184,9 @@ class SpiderFootScanner():
 
         self.__setStatus("INITIALIZING", time.time() * 1000, None)
 
+        # Used when module threading is enabled
+        self.eventQueue = None
+
         if start:
             self.__startScan()
 
@@ -222,13 +229,16 @@ class SpiderFootScanner():
         self.__status = status
         self.__dbh.scanInstanceSet(self.__scanId, started, ended, status)
 
-    def __startScan(self):
+    def __startScan(self, threaded=True):
         """Start running a scan."""
 
         aborted = False
 
         self.__setStatus("STARTING", time.time() * 1000, None)
         self.__sf.status(f"Scan [{self.__scanId}] initiated.")
+
+        if threaded:
+            self.eventQueue = queue.Queue()
 
         try:
             # moduleList = list of modules the user wants to run
@@ -276,22 +286,32 @@ class SpiderFootScanner():
                 if self.__config['__outputfilter']:
                     mod.setOutputFilter(self.__config['__outputfilter'])
 
+                # Register the target with the module
+                mod.setTarget(self.__target)
+
+                if threaded:
+                    # Set up the outgoing event queue
+                    mod.outgoingEventQueue = self.eventQueue
+                    mod.incomingEventQueue = queue.Queue()
+
                 self.__sf.status(modName + " module loaded.")
 
-            # Register listener modules and then start all modules sequentially
-            for module in list(self.__moduleInstances.values()):
-                # Register the target with the module
-                module.setTarget(self.__target)
+            # sort modules by priority
+            self.__moduleInstances = OrderedDict(sorted(self.__moduleInstances.items(), key=lambda m: m[-1]._priority))
 
-                for listenerModule in list(self.__moduleInstances.values()):
-                    # Careful not to register twice or you will get duplicate events
-                    if listenerModule in module._listenerModules:
-                        continue
-                    # Note the absence of a check for whether a module can register
-                    # to itself. That is intentional because some modules will
-                    # act on their own notifications (e.g. sfp_dns)!
-                    if listenerModule.watchedEvents() is not None:
-                        module.registerListener(listenerModule)
+            if not threaded:
+                # Register listener modules and then start all modules sequentially
+                for module in list(self.__moduleInstances.values()):
+                    
+                    for listenerModule in list(self.__moduleInstances.values()):
+                        # Careful not to register twice or you will get duplicate events
+                        if listenerModule in module._listenerModules:
+                            continue
+                        # Note the absence of a check for whether a module can register
+                        # to itself. That is intentional because some modules will
+                        # act on their own notifications (e.g. sfp_dns)!
+                        if listenerModule.watchedEvents() is not None:
+                            module.registerListener(listenerModule)
 
             # Now we are ready to roll..
             self.__setStatus("RUNNING")
@@ -302,9 +322,14 @@ class SpiderFootScanner():
             psMod.setTarget(self.__target)
             psMod.setDbh(self.__dbh)
             psMod.clearListeners()
-            for mod in list(self.__moduleInstances.values()):
-                if mod.watchedEvents() is not None:
-                    psMod.registerListener(mod)
+            if threaded:
+                psMod.outgoingEventQueue = self.eventQueue
+                psMod.incomingEventQueue = queue.Queue()
+            else:
+                for mod in list(self.__moduleInstances.values()):
+                    if mod.watchedEvents() is not None:
+                        psMod.registerListener(mod)
+
 
             # Create the "ROOT" event which un-triggered modules will link events to
             rootEvent = SpiderFootEvent("ROOT", self.__targetValue, "", None)
@@ -326,11 +351,15 @@ class SpiderFootScanner():
 
             # Check in case the user requested to stop the scan between modules
             # initializing
-            for module in list(self.__moduleInstances.values()):
-                if module.checkForStop():
+            for mod in list(self.__moduleInstances.values()):
+                if mod.checkForStop():
                     self.__setStatus('ABORTING')
                     aborted = True
                     break
+
+            # start threads
+            if threaded and not aborted:
+                self.waitForThreads()
 
             if aborted:
                 self.__sf.status(f"Scan [{self.__scanId}] aborted.")
@@ -347,3 +376,76 @@ class SpiderFootScanner():
             self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
 
         self.__dbh.close()
+
+    def waitForThreads(self):
+
+        try:
+            if not self.eventQueue:
+                return
+
+            # start one thread for each module
+            for mod in self.__moduleInstances.values():
+                mod.start()
+
+            # watch for newly-generated events
+            while True:
+
+                try:
+                    sfEvent = self.eventQueue.get_nowait()
+                    self.__sf.debug(f"waitForThreads() got event [{sfEvent.name}] from eventQueue.")
+                except queue.Empty:
+                    # check if we're finished
+                    if self.threadsFinished():
+                        sleep(.1)
+                        # but are we really?
+                        if self.threadsFinished():
+                            break
+                    else:
+                        sleep(.01)
+                        continue
+
+                if not isinstance(sfEvent, SpiderFootEvent):
+                    raise TypeError(f"sfEvent is {type(sfEvent)}; expected SpiderFootEvent")
+
+                # for every module
+                for mod in self.__moduleInstances.values():
+                    # check if it's been aborted
+                    if mod._stopScanning:
+                        self.__sf.status(f"Scan [{self.__scanId}] aborted.")
+                        break
+                    # send the new event if applicable
+                    watchedEvents = mod.watchedEvents()
+                    if sfEvent.eventType in watchedEvents or "*" in watchedEvents:
+                        mod.incomingEventQueue.put(deepcopy(sfEvent))
+
+        except KeyboardInterrupt:
+            self.__sf.status(f"Scan [{self.__scanId}] aborted.")
+
+        finally:
+            # tell the modules to stop
+            for mod in self.__moduleInstances.values():
+                mod._stopScanning = True
+
+    def threadsFinished(self):
+
+        if not self.eventQueue:
+            return
+
+        queues_empty = [m.incomingEventQueue.empty() for m in self.__moduleInstances.values()]
+        modules_running = [m.running for m in self.__moduleInstances.values()]
+
+        if modules_running.count(True) == 0 and not all(queues_empty):
+            self.__sf.debug(f"Clearing queues for stalled/aborted modules.")
+            for mod in self.__moduleInstances.values():
+                try:
+                    while True:
+                        mod.incomingEventQueue.get_nowait()
+                except Exception:
+                    pass
+        #self.__sf.debug(f"queues_empty: {queues_empty}")
+        #self.__sf.debug(f"modules_running: {modules_running}")
+        #self.__sf.debug(f"eventQueue empty: {self.eventQueue.empty()}")
+
+        if self.eventQueue.empty() and all(queues_empty) and modules_running.count(True) == 0:
+            return True
+        return False
