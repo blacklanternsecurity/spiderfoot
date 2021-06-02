@@ -1,5 +1,5 @@
-import queue
 import logging
+import queue
 import threading
 from time import sleep
 from spiderfoot import SpiderFootDb
