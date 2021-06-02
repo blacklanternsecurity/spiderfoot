@@ -1,6 +1,6 @@
 import logging
-import queue
 import threading
+import queue
 from time import sleep
 from spiderfoot import SpiderFootDb
 
